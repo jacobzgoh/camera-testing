@@ -1,8 +1,8 @@
-# Person Outline Camera
+# Person Tracking Camera
 
-Minimal C++ application that opens a camera, segments people, and draws a green outline around each person.
+Minimal C++ application that opens a camera, detects people, and draws green tracking boxes around each person.
 
-The app uses OpenCV for camera capture, display, DNN inference, mask post-processing, and contour drawing. It expects a YOLO segmentation ONNX model such as `yolov8n-seg.onnx`.
+The app uses OpenCV for camera capture, display, DNN inference, non-maximum suppression, and lightweight box tracking. It expects a YOLO segmentation ONNX model such as `yolov8n-seg.onnx`, but the live display uses boxes instead of segmentation outlines because boxes are more stable in crowded pool footage.
 
 ## Build on macOS
 
@@ -45,10 +45,21 @@ Press `q` or `Esc` to quit.
 --input PIXELS     Square model input size
 --conf FLOAT       Person confidence threshold
 --nms FLOAT        NMS threshold
---mask FLOAT       Mask threshold
+--max-detections N Keep up to this many people after NMS
+--track-iou FLOAT  Minimum IoU to match a person across frames
+--track-lost N     Frames to keep a missing person on screen
+--mask FLOAT       Accepted for old commands; boxes do not use masks
 --headless         Run without a display window and print FPS only
 --check-model      Load the model and exit without opening the camera
 ```
+
+For busy pool footage, start with the defaults. If the camera misses too many people, lower `--conf` a little:
+
+```sh
+./build/person_outline --model models/yolov8n-seg.onnx --camera 0 --conf 0.20 --max-detections 150
+```
+
+If boxes jump IDs too often, lower `--track-iou` slightly. If boxes linger too long after a person disappears, lower `--track-lost`.
 
 The downloaded model has a fixed `640x640` input. Keep `--input 640` with this model. To use a smaller input for embedded performance, export a separate model at that exact size first; changing only the command-line value is not sufficient.
 
@@ -92,9 +103,9 @@ BGR frame
   -> letterbox to model input
   -> YOLO segmentation inference
   -> keep person class only
-  -> reconstruct person mask
-  -> find contours
-  -> draw green outline
+  -> non-maximum suppression
+  -> match boxes to existing track IDs
+  -> draw green person boxes
 ```
 
 ## Model License

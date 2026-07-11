@@ -27,9 +27,12 @@ struct Options {
     int capture_width = 1280;
     int capture_height = 720;
     int input_size = kDefaultInputSize;
-    float confidence_threshold = 0.35f;
-    float nms_threshold = 0.45f;
+    float confidence_threshold = 0.25f;
+    float nms_threshold = 0.50f;
     float mask_threshold = 0.50f;
+    float track_iou_threshold = 0.25f;
+    int max_detections = 100;
+    int max_missing_frames = 12;
     bool headless = false;
     bool check_model = false;
 };
@@ -44,7 +47,14 @@ struct Letterbox {
 struct Detection {
     cv::Rect box;
     float confidence = 0.0f;
-    cv::Mat mask_coefficients;
+};
+
+struct Track {
+    int id = 0;
+    cv::Rect2f box;
+    float confidence = 0.0f;
+    int missing_frames = 0;
+    int age = 0;
 };
 
 struct ProtoView {
@@ -67,9 +77,12 @@ void print_usage(const char* binary_name) {
         << "  --width PIXELS     Capture width request (default: 1280)\n"
         << "  --height PIXELS    Capture height request (default: 720)\n"
         << "  --input PIXELS     Square model input size (default: 640)\n"
-        << "  --conf FLOAT       Person confidence threshold (default: 0.35)\n"
-        << "  --nms FLOAT        NMS threshold (default: 0.45)\n"
-        << "  --mask FLOAT       Mask threshold (default: 0.50)\n"
+        << "  --conf FLOAT       Person confidence threshold (default: 0.25)\n"
+        << "  --nms FLOAT        NMS threshold (default: 0.50)\n"
+        << "  --max-detections N Keep up to this many people after NMS (default: 100)\n"
+        << "  --track-iou FLOAT  Minimum IoU to match a person across frames (default: 0.25)\n"
+        << "  --track-lost N     Frames to keep a missing person on screen (default: 12)\n"
+        << "  --mask FLOAT       Accepted for old commands; boxes do not use masks\n"
         << "  --headless         Run without a display window and print FPS only\n"
         << "  --check-model      Load the model and exit without opening the camera\n"
         << "  --help             Show this message\n";
@@ -116,6 +129,12 @@ Options parse_args(int argc, char** argv) {
             options.nms_threshold = parse_value<float>(require_value(arg), arg);
         } else if (arg == "--mask") {
             options.mask_threshold = parse_value<float>(require_value(arg), arg);
+        } else if (arg == "--max-detections") {
+            options.max_detections = parse_value<int>(require_value(arg), arg);
+        } else if (arg == "--track-iou") {
+            options.track_iou_threshold = parse_value<float>(require_value(arg), arg);
+        } else if (arg == "--track-lost") {
+            options.max_missing_frames = parse_value<int>(require_value(arg), arg);
         } else if (arg == "--headless") {
             options.headless = true;
         } else if (arg == "--check-model") {
@@ -130,8 +149,12 @@ Options parse_args(int argc, char** argv) {
     }
     if (options.confidence_threshold < 0.0f || options.confidence_threshold > 1.0f ||
         options.nms_threshold < 0.0f || options.nms_threshold > 1.0f ||
-        options.mask_threshold < 0.0f || options.mask_threshold > 1.0f) {
+        options.mask_threshold < 0.0f || options.mask_threshold > 1.0f ||
+        options.track_iou_threshold < 0.0f || options.track_iou_threshold > 1.0f) {
         throw std::runtime_error("Thresholds must be between 0 and 1");
+    }
+    if (options.max_detections <= 0 || options.max_missing_frames < 0) {
+        throw std::runtime_error("--max-detections must be positive and --track-lost must be non-negative");
     }
 
     return options;
@@ -232,12 +255,21 @@ cv::Rect clamp_rect(const cv::Rect& rect, const cv::Size& bounds) {
     return rect & cv::Rect(0, 0, bounds.width, bounds.height);
 }
 
+cv::Rect to_integer_rect(const cv::Rect2f& rect) {
+    return cv::Rect(
+        cv::Point(static_cast<int>(std::round(rect.x)), static_cast<int>(std::round(rect.y))),
+        cv::Point(
+            static_cast<int>(std::round(rect.x + rect.width)),
+            static_cast<int>(std::round(rect.y + rect.height))));
+}
+
 std::vector<Detection> parse_detections(
     const cv::Mat& output,
     const Letterbox& letterbox,
     const cv::Size& frame_size,
     float confidence_threshold,
-    float nms_threshold) {
+    float nms_threshold,
+    int max_detections) {
     const cv::Mat predictions = flatten_output(output);
     const int attributes = predictions.cols;
     const int class_count = attributes - 4 - kMaskChannels;
@@ -247,7 +279,6 @@ std::vector<Detection> parse_detections(
 
     std::vector<cv::Rect> boxes;
     std::vector<float> scores;
-    std::vector<cv::Mat> coefficients;
 
     for (int i = 0; i < predictions.rows; ++i) {
         const float* row = predictions.ptr<float>(i);
@@ -276,82 +307,133 @@ std::vector<Detection> parse_detections(
 
         boxes.push_back(box);
         scores.push_back(person_score);
-        coefficients.emplace_back(1, kMaskChannels, CV_32F, const_cast<float*>(row + 4 + class_count));
-        coefficients.back() = coefficients.back().clone();
     }
 
     std::vector<int> keep;
-    cv::dnn::NMSBoxes(boxes, scores, confidence_threshold, nms_threshold, keep);
+    cv::dnn::NMSBoxes(boxes, scores, confidence_threshold, nms_threshold, keep, 1.0f, max_detections);
 
     std::vector<Detection> detections;
     detections.reserve(keep.size());
     for (const int index : keep) {
-        detections.push_back({boxes[index], scores[index], coefficients[index]});
+        detections.push_back({boxes[index], scores[index]});
     }
     return detections;
 }
 
-cv::Mat sigmoid(const cv::Mat& input) {
-    cv::Mat negated;
-    cv::multiply(input, -1.0, negated);
-    cv::exp(negated, negated);
-    return 1.0 / (1.0 + negated);
-}
-
-cv::Mat make_person_mask(
-    const Detection& detection,
-    const ProtoView& proto,
-    const Letterbox& letterbox,
-    const cv::Size& frame_size,
-    int input_size,
-    float mask_threshold) {
-    if (proto.height * proto.width != proto.data.cols) {
-        throw std::runtime_error("Unexpected YOLO mask proto output shape");
+float intersection_over_union(const cv::Rect2f& first, const cv::Rect2f& second) {
+    const cv::Rect2f overlap = first & second;
+    const float overlap_area = overlap.area();
+    if (overlap_area <= 0.0f) {
+        return 0.0f;
     }
 
-    cv::Mat mask = detection.mask_coefficients * proto.data;
-    mask = mask.reshape(1, proto.height);
-    mask = sigmoid(mask);
-
-    cv::Mat mask_on_input;
-    cv::resize(mask, mask_on_input, cv::Size(input_size, input_size), 0.0, 0.0, cv::INTER_LINEAR);
-
-    const int unpadded_width = static_cast<int>(std::round(frame_size.width * letterbox.scale));
-    const int unpadded_height = static_cast<int>(std::round(frame_size.height * letterbox.scale));
-    const cv::Rect valid_region(letterbox.pad_x, letterbox.pad_y, unpadded_width, unpadded_height);
-    cv::Mat unpadded = mask_on_input(clamp_rect(valid_region, mask_on_input.size()));
-
-    cv::Mat full_size;
-    cv::resize(unpadded, full_size, frame_size, 0.0, 0.0, cv::INTER_LINEAR);
-
-    cv::Mat binary;
-    cv::threshold(full_size, binary, mask_threshold, 255.0, cv::THRESH_BINARY);
-    binary.convertTo(binary, CV_8U);
-
-    cv::Mat boxed_mask = cv::Mat::zeros(frame_size, CV_8U);
-    binary(detection.box).copyTo(boxed_mask(detection.box));
-    return boxed_mask;
+    const float union_area = first.area() + second.area() - overlap_area;
+    return union_area <= 0.0f ? 0.0f : overlap_area / union_area;
 }
 
-void draw_green_outlines(
-    cv::Mat& frame,
+std::vector<Track> update_tracks(
+    const std::vector<Track>& current_tracks,
     const std::vector<Detection>& detections,
-    const ProtoView& proto,
-    const Letterbox& letterbox,
-    int input_size,
-    float mask_threshold) {
+    int& next_track_id,
+    float iou_threshold,
+    int max_missing_frames) {
+    std::vector<Track> updated = current_tracks;
+    std::vector<bool> matched_detection(detections.size(), false);
+
+    for (Track& track : updated) {
+        int best_index = -1;
+        float best_iou = iou_threshold;
+        for (int i = 0; i < static_cast<int>(detections.size()); ++i) {
+            if (matched_detection[i]) {
+                continue;
+            }
+
+            const float iou = intersection_over_union(track.box, cv::Rect2f(detections[i].box));
+            if (iou > best_iou) {
+                best_iou = iou;
+                best_index = i;
+            }
+        }
+
+        if (best_index >= 0) {
+            const cv::Rect2f detected_box(detections[best_index].box);
+            track.box.x = track.box.x * 0.65f + detected_box.x * 0.35f;
+            track.box.y = track.box.y * 0.65f + detected_box.y * 0.35f;
+            track.box.width = track.box.width * 0.65f + detected_box.width * 0.35f;
+            track.box.height = track.box.height * 0.65f + detected_box.height * 0.35f;
+            track.confidence = detections[best_index].confidence;
+            track.missing_frames = 0;
+            track.age += 1;
+            matched_detection[best_index] = true;
+        } else {
+            track.missing_frames += 1;
+            track.confidence *= 0.85f;
+            track.age += 1;
+        }
+    }
+
+    updated.erase(
+        std::remove_if(
+            updated.begin(),
+            updated.end(),
+            [max_missing_frames](const Track& track) {
+                return track.missing_frames > max_missing_frames;
+            }),
+        updated.end());
+
+    for (int i = 0; i < static_cast<int>(detections.size()); ++i) {
+        if (!matched_detection[i]) {
+            updated.push_back({
+                next_track_id++,
+                cv::Rect2f(detections[i].box),
+                detections[i].confidence,
+                0,
+                1});
+        }
+    }
+
+    return updated;
+}
+
+void draw_tracks(
+    cv::Mat& frame,
+    const std::vector<Track>& tracks) {
     const cv::Scalar green(0, 255, 0);
-    const cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
-    for (const Detection& detection : detections) {
-        cv::Mat mask = make_person_mask(detection, proto, letterbox, frame.size(), input_size, mask_threshold);
+    const cv::Scalar stale_green(0, 130, 0);
+    for (const Track& track : tracks) {
+        const cv::Rect box = clamp_rect(to_integer_rect(track.box), frame.size());
+        if (box.empty()) {
+            continue;
+        }
 
-        cv::Mat cleaned;
-        cv::morphologyEx(mask, cleaned, cv::MORPH_OPEN, kernel);
-        cv::morphologyEx(cleaned, cleaned, cv::MORPH_CLOSE, kernel);
+        const bool active = track.missing_frames == 0;
+        const cv::Scalar color = active ? green : stale_green;
+        const int thickness = active ? 3 : 2;
+        cv::rectangle(frame, box, color, thickness, cv::LINE_AA);
 
-        std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(cleaned, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-        cv::drawContours(frame, contours, -1, green, 3, cv::LINE_AA);
+        std::ostringstream label;
+        label.precision(0);
+        label << "ID " << track.id << " " << std::fixed << track.confidence * 100.0f << "%";
+        const std::string text = label.str();
+
+        int baseline = 0;
+        const cv::Size text_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.55, 2, &baseline);
+        const int label_y = std::max(0, box.y - text_size.height - baseline - 6);
+        const cv::Rect label_background(
+            box.x,
+            label_y,
+            std::min(text_size.width + 10, frame.cols - box.x),
+            text_size.height + baseline + 6);
+        cv::rectangle(frame, label_background, color, cv::FILLED);
+        cv::putText(
+            frame,
+            text,
+            cv::Point(box.x + 5, label_y + text_size.height + 1),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.55,
+            cv::Scalar(0, 0, 0),
+            2,
+            cv::LINE_AA);
     }
 }
 
@@ -394,11 +476,13 @@ int main(int argc, char** argv) {
         camera.set(cv::CAP_PROP_FRAME_HEIGHT, options.capture_height);
 
         if (!options.headless) {
-            cv::namedWindow("Person Outline", cv::WINDOW_NORMAL);
+            cv::namedWindow("Person Tracking", cv::WINDOW_NORMAL);
         }
 
         auto last_time = std::chrono::steady_clock::now();
         double fps = 0.0;
+        std::vector<Track> tracks;
+        int next_track_id = 1;
 
         while (true) {
             cv::Mat frame;
@@ -410,15 +494,21 @@ int main(int argc, char** argv) {
             const Letterbox letterbox = make_letterbox(frame, options.input_size);
             const std::vector<cv::Mat> outputs = run_model(net, letterbox.image, options.input_size);
             const ModelOutputs model_outputs = identify_outputs(outputs);
-            const ProtoView proto = flatten_proto(*model_outputs.prototypes);
             const std::vector<Detection> detections = parse_detections(
                 *model_outputs.detections,
                 letterbox,
                 frame.size(),
                 options.confidence_threshold,
-                options.nms_threshold);
+                options.nms_threshold,
+                options.max_detections);
 
-            draw_green_outlines(frame, detections, proto, letterbox, options.input_size, options.mask_threshold);
+            tracks = update_tracks(
+                tracks,
+                detections,
+                next_track_id,
+                options.track_iou_threshold,
+                options.max_missing_frames);
+            draw_tracks(frame, tracks);
 
             const auto now = std::chrono::steady_clock::now();
             const double seconds = std::chrono::duration<double>(now - last_time).count();
@@ -428,10 +518,11 @@ int main(int argc, char** argv) {
             }
 
             if (options.headless) {
-                std::cout << "\r" << fps << " FPS, people: " << detections.size() << std::flush;
+                std::cout << "\r" << fps << " FPS, detections: " << detections.size()
+                          << ", tracks: " << tracks.size() << std::flush;
             } else {
                 draw_fps(frame, fps);
-                cv::imshow("Person Outline", frame);
+                cv::imshow("Person Tracking", frame);
                 const int key = cv::waitKey(1);
                 if (key == 27 || key == 'q' || key == 'Q') {
                     break;
