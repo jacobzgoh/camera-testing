@@ -1,10 +1,49 @@
 # Person Tracking Camera
 
-Minimal C++ application that opens a camera, detects people, and draws green tracking boxes around each person.
+Minimal application that opens a camera, detects people, and draws green tracking boxes around each person.
 
-The app uses OpenCV for camera capture, display, DNN inference, non-maximum suppression, and lightweight box tracking. It expects a YOLO segmentation ONNX model such as `yolov8n-seg.onnx`, but the live display uses boxes instead of segmentation outlines because boxes are more stable in crowded pool footage.
+The preferred runner uses TensorFlow Lite/LiteRT for inference and OpenCV for camera capture, display, non-maximum suppression, and lightweight box tracking. The older C++ ONNX runner is still available as a fallback.
 
-## Build on macOS
+## Run on macOS with TFLite / LiteRT
+
+Install Python 3.12 first:
+
+```sh
+brew install python@3.12
+```
+
+Export the TFLite model:
+
+```sh
+sh scripts/export_tflite_model.sh
+```
+
+The script downloads the official Ultralytics `yolov8n-seg.pt` weights, creates `.venv-tflite`, installs the LiteRT exporter/runtime packages, and exports `models/yolov8n-seg.tflite`.
+
+Run:
+
+```sh
+. .venv-tflite/bin/activate
+python scripts/run_tflite_camera.py --model models/yolov8n-seg.tflite --camera 0
+```
+
+For crowded pool footage:
+
+```sh
+. .venv-tflite/bin/activate
+python scripts/run_tflite_camera.py --model models/yolov8n-seg.tflite --camera 0 --conf 0.20 --nms 0.60 --max-detections 150 --track-iou 0.20 --track-lost 15
+```
+
+Press `q` or `Esc` to quit.
+
+Check that LiteRT can load the exported model without opening the camera:
+
+```sh
+. .venv-tflite/bin/activate
+python scripts/run_tflite_camera.py --model models/yolov8n-seg.tflite --check-model
+```
+
+## C++ ONNX Fallback
 
 Install OpenCV first:
 
@@ -12,13 +51,11 @@ Install OpenCV first:
 brew install opencv cmake
 ```
 
-Download the model:
+Download the ONNX model:
 
 ```sh
 sh scripts/download_model.sh
 ```
-
-The script downloads the official Ultralytics `yolov8n-seg.pt` weights, creates a local `.venv` if needed, and exports `models/yolov8n-seg.onnx`.
 
 Build:
 
@@ -33,12 +70,10 @@ Run:
 ./build/person_outline --model models/yolov8n-seg.onnx --camera 0
 ```
 
-Press `q` or `Esc` to quit.
-
 ## Run Options
 
 ```text
---model PATH       YOLO segmentation ONNX model path
+--model PATH       YOLO model path
 --camera INDEX     Camera index for OpenCV VideoCapture
 --width PIXELS     Capture width request
 --height PIXELS    Capture height request
@@ -56,17 +91,17 @@ Press `q` or `Esc` to quit.
 For busy pool footage, start with the defaults. If the camera misses too many people, lower `--conf` a little:
 
 ```sh
-./build/person_outline --model models/yolov8n-seg.onnx --camera 0 --conf 0.20 --max-detections 150
+python scripts/run_tflite_camera.py --model models/yolov8n-seg.tflite --camera 0 --conf 0.20 --max-detections 150
 ```
 
 If boxes jump IDs too often, lower `--track-iou` slightly. If boxes linger too long after a person disappears, lower `--track-lost`.
 
-The downloaded model has a fixed `640x640` input. Keep `--input 640` with this model. To use a smaller input for embedded performance, export a separate model at that exact size first; changing only the command-line value is not sufficient.
+The downloaded models have a fixed `640x640` input. Keep `--input 640` with these models. To use a smaller input for embedded performance, export a separate model at that exact size first; changing only the command-line value is not sufficient.
 
-Reducing camera capture size can still lower mask-resize and display costs without changing the model:
+Reducing camera capture size can still lower display costs without changing the model:
 
 ```sh
-./build/person_outline --model models/yolov8n-seg.onnx --input 640 --width 640 --height 480
+python scripts/run_tflite_camera.py --model models/yolov8n-seg.tflite --input 640 --width 640 --height 480
 ```
 
 Check that OpenCV can load the exported model without opening the camera:
@@ -79,11 +114,13 @@ Check that OpenCV can load the exported model without opening the camera:
 
 The application core is portable C++17 and OpenCV, but the current QNX Raspberry Pi 5 BSP does not list a CSI camera driver. Treat camera integration as required platform work, not as a ready-made OpenCV camera index.
 
+The current TFLite runner is Python-based for Mac testing. For QNX deployment, use the same detection/tracking logic but link against a QNX-compatible TensorFlow Lite or LiteRT C/C++ runtime.
+
 The QNX build needs:
 
 - OpenCV built for QNX with `core`, `imgproc`, `videoio`, `highgui`, and `dnn`
 - A camera source exposed to OpenCV `VideoCapture`, or a small replacement for the `cv::VideoCapture` section in `src/main.cpp`
-- The ONNX model copied to the target filesystem
+- The TFLite model copied to the target filesystem
 
 QNX SDP 8.0.3 and the Raspberry Pi 5 BSP officially use a Linux or Windows development host. On a Mac, use a supported Linux or Windows VM for the QNX cross-build tools.
 
