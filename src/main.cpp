@@ -2,8 +2,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <sstream>
 #include <string>
@@ -15,14 +17,27 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 
+#if defined(__QNXNTO__)
+#include <camera/camera_api.h>
+#include <errno.h>
+#include <sys/neutrino.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 constexpr int kPersonClassId = 0;
 constexpr int kMaskChannels = 32;
+constexpr int kCocoClassCount = 80;
 constexpr int kDefaultInputSize = 640;
 
+#if defined(__QNXNTO__)
+constexpr int kQnxPulseBufferAvailable = _PULSE_CODE_MINAVAIL + 0;
+constexpr int kQnxPulseStatusAvailable = _PULSE_CODE_MINAVAIL + 1;
+#endif
+
 struct Options {
-    std::string model_path = "models/yolov8n-seg.onnx";
+    std::string model_path = "models/yolov8n-640.onnx";
     int camera_index = 0;
     int capture_width = 1280;
     int capture_height = 720;
@@ -35,6 +50,11 @@ struct Options {
     int max_missing_frames = 12;
     bool headless = false;
     bool check_model = false;
+#if defined(__QNXNTO__)
+    bool use_qnx_camera = true;
+#else
+    bool use_qnx_camera = false;
+#endif
 };
 
 struct Letterbox {
@@ -52,9 +72,11 @@ struct Detection {
 struct Track {
     int id = 0;
     cv::Rect2f box;
+    cv::Point2f velocity{0.0f, 0.0f};
     float confidence = 0.0f;
     int missing_frames = 0;
     int age = 0;
+    int hits = 0;
 };
 
 struct ProtoView {
@@ -72,7 +94,7 @@ void print_usage(const char* binary_name) {
     std::cout
         << "Usage: " << binary_name << " [options]\n\n"
         << "Options:\n"
-        << "  --model PATH       YOLO segmentation ONNX model path (default: models/yolov8n-seg.onnx)\n"
+        << "  --model PATH       YOLO ONNX model path (default: models/yolov8n-640.onnx)\n"
         << "  --camera INDEX     Camera index for OpenCV VideoCapture (default: 0)\n"
         << "  --width PIXELS     Capture width request (default: 1280)\n"
         << "  --height PIXELS    Capture height request (default: 720)\n"
@@ -83,6 +105,8 @@ void print_usage(const char* binary_name) {
         << "  --track-iou FLOAT  Minimum IoU to match a person across frames (default: 0.25)\n"
         << "  --track-lost N     Frames to keep a missing person on screen (default: 12)\n"
         << "  --mask FLOAT       Accepted for old commands; boxes do not use masks\n"
+        << "  --qnx-camera       Use QNX Camera API instead of OpenCV VideoCapture\n"
+        << "  --opencv-camera    Use OpenCV VideoCapture instead of QNX Camera API\n"
         << "  --headless         Run without a display window and print FPS only\n"
         << "  --check-model      Load the model and exit without opening the camera\n"
         << "  --help             Show this message\n";
@@ -135,6 +159,10 @@ Options parse_args(int argc, char** argv) {
             options.track_iou_threshold = parse_value<float>(require_value(arg), arg);
         } else if (arg == "--track-lost") {
             options.max_missing_frames = parse_value<int>(require_value(arg), arg);
+        } else if (arg == "--qnx-camera") {
+            options.use_qnx_camera = true;
+        } else if (arg == "--opencv-camera") {
+            options.use_qnx_camera = false;
         } else if (arg == "--headless") {
             options.headless = true;
         } else if (arg == "--check-model") {
@@ -169,9 +197,8 @@ ModelOutputs identify_outputs(const std::vector<cv::Mat>& outputs) {
             result.prototypes = &output;
         }
     }
-    if (result.detections == nullptr || result.prototypes == nullptr) {
-        throw std::runtime_error(
-            "Model is not a supported YOLOv8 segmentation export: expected one 3D detection output and one 4D mask output");
+    if (result.detections == nullptr) {
+        throw std::runtime_error("Model is not a supported YOLO export: expected at least one 3D detection output");
     }
     return result;
 }
@@ -195,7 +222,9 @@ std::vector<cv::Mat> run_model(cv::dnn::Net& net, const cv::Mat& image, int inpu
             ". The bundled model is exported for 640x640; use --input 640 or export a model at the requested size. OpenCV: " +
             std::string(error.what()));
     }
-    identify_outputs(outputs);
+    if (identify_outputs(outputs).detections == nullptr) {
+        throw std::runtime_error("Model did not produce a detection output");
+    }
     return outputs;
 }
 
@@ -272,13 +301,22 @@ std::vector<Detection> parse_detections(
     int max_detections) {
     const cv::Mat predictions = flatten_output(output);
     const int attributes = predictions.cols;
-    const int class_count = attributes - 4 - kMaskChannels;
+    const int class_count =
+        attributes >= 4 + kCocoClassCount + kMaskChannels
+            ? attributes - 4 - kMaskChannels
+            : attributes - 4;
     if (class_count <= kPersonClassId) {
         throw std::runtime_error("Model output does not contain a person class");
     }
 
     std::vector<cv::Rect> boxes;
     std::vector<float> scores;
+    double coordinate_extent = 0.0;
+    if (!predictions.empty()) {
+        cv::Mat coordinates = predictions.colRange(0, 4);
+        cv::minMaxLoc(cv::abs(coordinates), nullptr, &coordinate_extent);
+    }
+    const float coordinate_scale = coordinate_extent <= 2.0 ? static_cast<float>(letterbox.image.rows) : 1.0f;
 
     for (int i = 0; i < predictions.rows; ++i) {
         const float* row = predictions.ptr<float>(i);
@@ -287,10 +325,10 @@ std::vector<Detection> parse_detections(
             continue;
         }
 
-        const float center_x = row[0];
-        const float center_y = row[1];
-        const float width = row[2];
-        const float height = row[3];
+        const float center_x = row[0] * coordinate_scale;
+        const float center_y = row[1] * coordinate_scale;
+        const float width = row[2] * coordinate_scale;
+        const float height = row[3] * coordinate_scale;
 
         const float x1 = (center_x - width / 2.0f - letterbox.pad_x) / letterbox.scale;
         const float y1 = (center_y - height / 2.0f - letterbox.pad_y) / letterbox.scale;
@@ -331,6 +369,27 @@ float intersection_over_union(const cv::Rect2f& first, const cv::Rect2f& second)
     return union_area <= 0.0f ? 0.0f : overlap_area / union_area;
 }
 
+cv::Point2f center_of(const cv::Rect2f& box) {
+    return {box.x + box.width / 2.0f, box.y + box.height / 2.0f};
+}
+
+cv::Rect2f predict_box(const Track& track) {
+    cv::Rect2f predicted = track.box;
+    predicted.x += track.velocity.x * static_cast<float>(std::min(track.missing_frames + 1, 3));
+    predicted.y += track.velocity.y * static_cast<float>(std::min(track.missing_frames + 1, 3));
+    return predicted;
+}
+
+float center_match_score(const cv::Rect2f& predicted, const cv::Rect2f& detected) {
+    const cv::Point2f predicted_center = center_of(predicted);
+    const cv::Point2f detected_center = center_of(detected);
+    const float dx = predicted_center.x - detected_center.x;
+    const float dy = predicted_center.y - detected_center.y;
+    const float distance = std::sqrt(dx * dx + dy * dy);
+    const float scale = std::max(20.0f, std::max(predicted.width, predicted.height) * 1.35f);
+    return std::max(0.0f, 1.0f - distance / scale);
+}
+
 std::vector<Track> update_tracks(
     const std::vector<Track>& current_tracks,
     const std::vector<Detection>& detections,
@@ -342,30 +401,44 @@ std::vector<Track> update_tracks(
 
     for (Track& track : updated) {
         int best_index = -1;
-        float best_iou = iou_threshold;
+        float best_score = 0.0f;
+        const cv::Rect2f predicted_box = predict_box(track);
         for (int i = 0; i < static_cast<int>(detections.size()); ++i) {
             if (matched_detection[i]) {
                 continue;
             }
 
-            const float iou = intersection_over_union(track.box, cv::Rect2f(detections[i].box));
-            if (iou > best_iou) {
-                best_iou = iou;
+            const cv::Rect2f detected_box(detections[i].box);
+            const float predicted_iou = intersection_over_union(predicted_box, detected_box);
+            const float current_iou = intersection_over_union(track.box, detected_box);
+            const float center_score = center_match_score(predicted_box, detected_box);
+            const float score = std::max(predicted_iou, current_iou) * 0.70f + center_score * 0.30f;
+            if ((predicted_iou >= iou_threshold || current_iou >= iou_threshold || center_score >= 0.62f) &&
+                score > best_score) {
+                best_score = score;
                 best_index = i;
             }
         }
 
         if (best_index >= 0) {
             const cv::Rect2f detected_box(detections[best_index].box);
+            const cv::Point2f old_center = center_of(track.box);
+            const cv::Point2f detected_center = center_of(detected_box);
+            const cv::Point2f measured_velocity = detected_center - old_center;
             track.box.x = track.box.x * 0.65f + detected_box.x * 0.35f;
             track.box.y = track.box.y * 0.65f + detected_box.y * 0.35f;
             track.box.width = track.box.width * 0.65f + detected_box.width * 0.35f;
             track.box.height = track.box.height * 0.65f + detected_box.height * 0.35f;
+            track.velocity = track.velocity * 0.55f + measured_velocity * 0.45f;
             track.confidence = detections[best_index].confidence;
             track.missing_frames = 0;
             track.age += 1;
+            track.hits += 1;
             matched_detection[best_index] = true;
         } else {
+            track.box.x += track.velocity.x;
+            track.box.y += track.velocity.y;
+            track.velocity *= 0.85f;
             track.missing_frames += 1;
             track.confidence *= 0.85f;
             track.age += 1;
@@ -386,8 +459,10 @@ std::vector<Track> update_tracks(
             updated.push_back({
                 next_track_id++,
                 cv::Rect2f(detections[i].box),
+                cv::Point2f(0.0f, 0.0f),
                 detections[i].confidence,
                 0,
+                1,
                 1});
         }
     }
@@ -445,6 +520,362 @@ void draw_fps(cv::Mat& frame, double fps) {
     cv::putText(frame, label.str(), cv::Point(16, 36), cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
 }
 
+class FrameSource {
+public:
+    virtual ~FrameSource() = default;
+    virtual cv::Mat read() = 0;
+};
+
+class OpenCvFrameSource final : public FrameSource {
+public:
+    explicit OpenCvFrameSource(const Options& options) : camera_(options.camera_index) {
+        if (!camera_.isOpened()) {
+            throw std::runtime_error("Could not open camera index " + std::to_string(options.camera_index));
+        }
+        camera_.set(cv::CAP_PROP_FRAME_WIDTH, options.capture_width);
+        camera_.set(cv::CAP_PROP_FRAME_HEIGHT, options.capture_height);
+    }
+
+    cv::Mat read() override {
+        cv::Mat frame;
+        camera_ >> frame;
+        if (frame.empty()) {
+            throw std::runtime_error("Camera returned an empty frame");
+        }
+        return frame;
+    }
+
+private:
+    cv::VideoCapture camera_;
+};
+
+#if defined(__QNXNTO__)
+int qnx_camera_buffer_width(const camera_buffer_t& buffer) {
+    switch (buffer.frametype) {
+        case CAMERA_FRAMETYPE_BGR8888:
+            return buffer.framedesc.bgr8888.width;
+        case CAMERA_FRAMETYPE_RGB8888:
+            return buffer.framedesc.rgb8888.width;
+        case CAMERA_FRAMETYPE_RGB888:
+            return buffer.framedesc.rgb888.width;
+        case CAMERA_FRAMETYPE_GRAY8:
+            return buffer.framedesc.gray8.width;
+        case CAMERA_FRAMETYPE_CBYCRY:
+            return buffer.framedesc.cbycry.width;
+        case CAMERA_FRAMETYPE_YCBYCR:
+            return buffer.framedesc.ycbycr.width;
+        case CAMERA_FRAMETYPE_YCRYCB:
+            return buffer.framedesc.ycrycb.width;
+        case CAMERA_FRAMETYPE_CRYCBY:
+            return buffer.framedesc.crycby.width;
+        default:
+            return -1;
+    }
+}
+
+int qnx_camera_buffer_height(const camera_buffer_t& buffer) {
+    switch (buffer.frametype) {
+        case CAMERA_FRAMETYPE_BGR8888:
+            return buffer.framedesc.bgr8888.height;
+        case CAMERA_FRAMETYPE_RGB8888:
+            return buffer.framedesc.rgb8888.height;
+        case CAMERA_FRAMETYPE_RGB888:
+            return buffer.framedesc.rgb888.height;
+        case CAMERA_FRAMETYPE_GRAY8:
+            return buffer.framedesc.gray8.height;
+        case CAMERA_FRAMETYPE_CBYCRY:
+            return buffer.framedesc.cbycry.height;
+        case CAMERA_FRAMETYPE_YCBYCR:
+            return buffer.framedesc.ycbycr.height;
+        case CAMERA_FRAMETYPE_YCRYCB:
+            return buffer.framedesc.ycrycb.height;
+        case CAMERA_FRAMETYPE_CRYCBY:
+            return buffer.framedesc.crycby.height;
+        default:
+            return -1;
+    }
+}
+
+cv::Mat qnx_camera_buffer_to_bgr(const camera_buffer_t& buffer) {
+    const int width = qnx_camera_buffer_width(buffer);
+    const int height = qnx_camera_buffer_height(buffer);
+    if (width <= 0 || height <= 0 || buffer.framebuf == nullptr) {
+        throw std::runtime_error("QNX camera returned an invalid frame buffer");
+    }
+
+    cv::Mat bgr;
+    switch (buffer.frametype) {
+        case CAMERA_FRAMETYPE_CBYCRY: {
+            cv::Mat yuv(height, width, CV_8UC2, buffer.framebuf, width * 2);
+            cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_UYVY);
+            break;
+        }
+        case CAMERA_FRAMETYPE_YCBYCR: {
+            cv::Mat yuv(height, width, CV_8UC2, buffer.framebuf, width * 2);
+            cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_YUY2);
+            break;
+        }
+        case CAMERA_FRAMETYPE_YCRYCB: {
+            cv::Mat yuv(height, width, CV_8UC2, buffer.framebuf, width * 2);
+            cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_YVYU);
+            break;
+        }
+        case CAMERA_FRAMETYPE_BGR8888: {
+            cv::Mat bgra(height, width, CV_8UC4, buffer.framebuf, width * 4);
+            cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
+            break;
+        }
+        case CAMERA_FRAMETYPE_RGB8888: {
+            cv::Mat rgba(height, width, CV_8UC4, buffer.framebuf, width * 4);
+            cv::cvtColor(rgba, bgr, cv::COLOR_RGBA2BGR);
+            break;
+        }
+        case CAMERA_FRAMETYPE_RGB888: {
+            cv::Mat rgb(height, width, CV_8UC3, buffer.framebuf, width * 3);
+            cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
+            break;
+        }
+        case CAMERA_FRAMETYPE_GRAY8: {
+            cv::Mat gray(height, width, CV_8UC1, buffer.framebuf, width);
+            cv::cvtColor(gray, bgr, cv::COLOR_GRAY2BGR);
+            break;
+        }
+        default:
+            throw std::runtime_error("Unsupported QNX camera frame type: " + std::to_string(buffer.frametype));
+    }
+    return bgr.clone();
+}
+
+class QnxCameraFrameSource final : public FrameSource {
+public:
+    explicit QnxCameraFrameSource(const Options& options) {
+        open_camera(static_cast<unsigned int>(options.camera_index));
+        configure_camera(options);
+        start_viewfinder();
+    }
+
+    ~QnxCameraFrameSource() override {
+        stop();
+    }
+
+    cv::Mat read() override {
+        while (true) {
+            _pulse pulse{};
+            if (MsgReceivePulse(channel_id_, &pulse, sizeof(pulse), nullptr) == -1) {
+                throw std::runtime_error("MsgReceivePulse failed: " + std::string(std::strerror(errno)));
+            }
+
+            if (pulse.code == kQnxPulseStatusAvailable) {
+                camera_devstatus_t status{};
+                uint16_t extra = 0;
+                camera_get_status_details(camera_handle_, pulse.value.sival_int, &status, &extra);
+                continue;
+            }
+            if (pulse.code != kQnxPulseBufferAvailable) {
+                continue;
+            }
+
+            camera_buffer_t buffer{};
+            const int rc = camera_get_viewfinder_buffers(camera_handle_, buffer_key_, &buffer, nullptr);
+            if (rc != CAMERA_EOK) {
+                throw std::runtime_error("camera_get_viewfinder_buffers failed: " + std::string(std::strerror(rc)));
+            }
+
+            try {
+                cv::Mat frame = qnx_camera_buffer_to_bgr(buffer);
+                camera_return_buffer(camera_handle_, &buffer);
+                return frame;
+            } catch (...) {
+                camera_return_buffer(camera_handle_, &buffer);
+                throw;
+            }
+        }
+    }
+
+private:
+    void open_camera(unsigned int camera_index) {
+        uint32_t supported_count = 0;
+        int rc = CAMERA_EOK;
+        for (int retry = 0; retry < 10; ++retry) {
+            rc = camera_get_supported_cameras(0, &supported_count, nullptr);
+            if (rc == CAMERA_EOK && supported_count > 0) {
+                break;
+            }
+            sleep(1);
+        }
+        if (rc != CAMERA_EOK || supported_count == 0) {
+            throw std::runtime_error("No QNX cameras are available");
+        }
+        if (camera_index >= supported_count) {
+            throw std::runtime_error("QNX camera index " + std::to_string(camera_index) +
+                                     " is outside valid range 0-" + std::to_string(supported_count - 1));
+        }
+
+        std::vector<camera_unit_t> cameras(supported_count);
+        uint32_t returned_count = supported_count;
+        rc = camera_get_supported_cameras(supported_count, &returned_count, cameras.data());
+        if (rc != CAMERA_EOK) {
+            throw std::runtime_error("camera_get_supported_cameras failed: " + std::string(std::strerror(rc)));
+        }
+
+        rc = camera_open(cameras[camera_index], CAMERA_MODE_RW, &camera_handle_);
+        if (rc != CAMERA_EOK) {
+            throw std::runtime_error("camera_open failed: " + std::string(std::strerror(rc)));
+        }
+    }
+
+    void configure_camera(const Options& options) {
+        camera_set_buffer_retrieval_mode(camera_handle_, CAMERA_BRM_LATEST_FLUSH);
+        const int create_window = 0;
+        camera_set_vf_property(camera_handle_, CAMERA_IMGPROP_CREATEWINDOW, create_window);
+
+        if (options.capture_width > 0 && options.capture_height > 0) {
+            camera_set_vf_property(
+                camera_handle_,
+                CAMERA_IMGPROP_WIDTH,
+                static_cast<unsigned int>(options.capture_width),
+                CAMERA_IMGPROP_HEIGHT,
+                static_cast<unsigned int>(options.capture_height));
+        }
+
+        camera_frametype_t frame_type{};
+        int rc = camera_get_vf_property(camera_handle_, CAMERA_IMGPROP_FORMAT, &frame_type);
+        if (rc != CAMERA_EOK) {
+            throw std::runtime_error("camera_get_vf_property(CAMERA_IMGPROP_FORMAT) failed: " + std::string(std::strerror(rc)));
+        }
+        if (is_supported_frame_type(frame_type)) {
+            return;
+        }
+
+        uint32_t frame_type_count = 0;
+        rc = camera_get_supported_vf_frame_types(camera_handle_, 0, &frame_type_count, nullptr);
+        if (rc != CAMERA_EOK || frame_type_count == 0) {
+            throw std::runtime_error("camera_get_supported_vf_frame_types failed");
+        }
+        std::vector<camera_frametype_t> frame_types(frame_type_count);
+        uint32_t returned = frame_type_count;
+        rc = camera_get_supported_vf_frame_types(camera_handle_, frame_type_count, &returned, frame_types.data());
+        if (rc != CAMERA_EOK) {
+            throw std::runtime_error("camera_get_supported_vf_frame_types failed: " + std::string(std::strerror(rc)));
+        }
+
+        const camera_frametype_t preferred[] = {
+            CAMERA_FRAMETYPE_YCBYCR,
+            CAMERA_FRAMETYPE_CBYCRY,
+            CAMERA_FRAMETYPE_BGR8888,
+            CAMERA_FRAMETYPE_RGB8888,
+            CAMERA_FRAMETYPE_RGB888,
+            CAMERA_FRAMETYPE_GRAY8,
+        };
+        for (camera_frametype_t candidate : preferred) {
+            if (std::find(frame_types.begin(), frame_types.end(), candidate) != frame_types.end()) {
+                rc = camera_set_vf_property(camera_handle_, CAMERA_IMGPROP_FORMAT, &candidate);
+                if (rc != CAMERA_EOK) {
+                    throw std::runtime_error("camera_set_vf_property(CAMERA_IMGPROP_FORMAT) failed: " + std::string(std::strerror(rc)));
+                }
+                return;
+            }
+        }
+        throw std::runtime_error("QNX camera does not expose a supported OpenCV-convertible frame type");
+    }
+
+    static bool is_supported_frame_type(camera_frametype_t frame_type) {
+        switch (frame_type) {
+            case CAMERA_FRAMETYPE_YCBYCR:
+            case CAMERA_FRAMETYPE_CBYCRY:
+            case CAMERA_FRAMETYPE_YCRYCB:
+            case CAMERA_FRAMETYPE_BGR8888:
+            case CAMERA_FRAMETYPE_RGB8888:
+            case CAMERA_FRAMETYPE_RGB888:
+            case CAMERA_FRAMETYPE_GRAY8:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    void start_viewfinder() {
+        channel_id_ = ChannelCreate(_NTO_CHF_PRIVATE);
+        if (channel_id_ == -1) {
+            throw std::runtime_error("ChannelCreate failed: " + std::string(std::strerror(errno)));
+        }
+        connection_id_ = ConnectAttach(0, 0, channel_id_, _NTO_SIDE_CHANNEL, 0);
+        if (connection_id_ == -1) {
+            throw std::runtime_error("ConnectAttach failed: " + std::string(std::strerror(errno)));
+        }
+
+        sigevent event{};
+        SIGEV_PULSE_PTR_INIT(&event, connection_id_, SIGEV_PULSE_PRIO_INHERIT, kQnxPulseBufferAvailable, this);
+        int rc = camera_enable_viewfinder_event(camera_handle_, CAMERA_EVENTMODE_READONLY, &buffer_key_, &event);
+        if (rc != CAMERA_EOK) {
+            throw std::runtime_error("camera_enable_viewfinder_event failed: " + std::string(std::strerror(rc)));
+        }
+        buffer_event_enabled_ = true;
+
+        SIGEV_PULSE_PTR_INIT(&event, connection_id_, SIGEV_PULSE_PRIO_INHERIT, kQnxPulseStatusAvailable, this);
+        rc = camera_enable_status_event(camera_handle_, &status_key_, &event);
+        if (rc == CAMERA_EOK) {
+            status_event_enabled_ = true;
+        }
+
+        rc = camera_start_viewfinder(camera_handle_, nullptr, nullptr, nullptr);
+        if (rc != CAMERA_EOK) {
+            throw std::runtime_error("camera_start_viewfinder failed: " + std::string(std::strerror(rc)));
+        }
+        viewfinder_started_ = true;
+    }
+
+    void stop() {
+        if (camera_handle_ != CAMERA_HANDLE_INVALID) {
+            if (viewfinder_started_) {
+                camera_stop_viewfinder(camera_handle_);
+                viewfinder_started_ = false;
+            }
+            if (status_event_enabled_) {
+                camera_disable_event(camera_handle_, status_key_);
+                status_event_enabled_ = false;
+            }
+            if (buffer_event_enabled_) {
+                camera_disable_event(camera_handle_, buffer_key_);
+                buffer_event_enabled_ = false;
+            }
+            camera_close(camera_handle_);
+            camera_handle_ = CAMERA_HANDLE_INVALID;
+        }
+        if (connection_id_ != -1) {
+            ConnectDetach(connection_id_);
+            connection_id_ = -1;
+        }
+        if (channel_id_ != -1) {
+            ChannelDestroy(channel_id_);
+            channel_id_ = -1;
+        }
+    }
+
+    int camera_handle_ = CAMERA_HANDLE_INVALID;
+    int channel_id_ = -1;
+    int connection_id_ = -1;
+    camera_eventkey_t buffer_key_{};
+    camera_eventkey_t status_key_{};
+    bool buffer_event_enabled_ = false;
+    bool status_event_enabled_ = false;
+    bool viewfinder_started_ = false;
+};
+#endif
+
+std::unique_ptr<FrameSource> make_frame_source(const Options& options) {
+#if defined(__QNXNTO__)
+    if (options.use_qnx_camera) {
+        return std::make_unique<QnxCameraFrameSource>(options);
+    }
+#else
+    if (options.use_qnx_camera) {
+        throw std::runtime_error("--qnx-camera is only available on QNX");
+    }
+#endif
+    return std::make_unique<OpenCvFrameSource>(options);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -458,22 +889,20 @@ int main(int argc, char** argv) {
             const cv::Mat test_image(options.input_size, options.input_size, CV_8UC3, cv::Scalar(114, 114, 114));
             const std::vector<cv::Mat> outputs = run_model(net, test_image, options.input_size);
             const ModelOutputs model_outputs = identify_outputs(outputs);
-            const ProtoView proto = flatten_proto(*model_outputs.prototypes);
             const cv::Mat detections = flatten_output(*model_outputs.detections);
             std::cout << "Model check passed: " << options.model_path
                       << " (input " << options.input_size << "x" << options.input_size
                       << ", predictions " << detections.rows
-                      << ", mask prototypes " << proto.data.rows << "x" << proto.height << "x" << proto.width
-                      << ")\n";
+                      << ", attributes " << detections.cols;
+            if (model_outputs.prototypes != nullptr) {
+                const ProtoView proto = flatten_proto(*model_outputs.prototypes);
+                std::cout << ", mask prototypes " << proto.data.rows << "x" << proto.height << "x" << proto.width;
+            }
+            std::cout << ")\n";
             return 0;
         }
 
-        cv::VideoCapture camera(options.camera_index);
-        if (!camera.isOpened()) {
-            throw std::runtime_error("Could not open camera index " + std::to_string(options.camera_index));
-        }
-        camera.set(cv::CAP_PROP_FRAME_WIDTH, options.capture_width);
-        camera.set(cv::CAP_PROP_FRAME_HEIGHT, options.capture_height);
+        std::unique_ptr<FrameSource> frame_source = make_frame_source(options);
 
         if (!options.headless) {
             cv::namedWindow("Person Tracking", cv::WINDOW_NORMAL);
@@ -485,11 +914,7 @@ int main(int argc, char** argv) {
         int next_track_id = 1;
 
         while (true) {
-            cv::Mat frame;
-            camera >> frame;
-            if (frame.empty()) {
-                throw std::runtime_error("Camera returned an empty frame");
-            }
+            cv::Mat frame = frame_source->read();
 
             const Letterbox letterbox = make_letterbox(frame, options.input_size);
             const std::vector<cv::Mat> outputs = run_model(net, letterbox.image, options.input_size);

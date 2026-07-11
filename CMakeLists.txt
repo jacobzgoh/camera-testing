@@ -28,6 +28,10 @@ add_executable(person_outline
 target_include_directories(person_outline PRIVATE ${OpenCV_INCLUDE_DIRS})
 target_link_libraries(person_outline PRIVATE ${OpenCV_LIBS})
 
+if(CMAKE_SYSTEM_NAME STREQUAL "QNX")
+    target_link_libraries(person_outline PRIVATE camera)
+endif()
+
 if(MSVC)
     target_compile_options(person_outline PRIVATE /W4)
 else()

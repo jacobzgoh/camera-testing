@@ -3,9 +3,12 @@ set -eu
 
 mkdir -p models
 
-PT_URL="https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n-seg.pt"
-PT_PATH="models/yolov8n-seg.pt"
-MODEL_PATH="models/yolov8n-seg.onnx"
+MODEL_NAME="${1:-yolov8n}"
+IMG_SIZE="${2:-640}"
+PT_URL="https://github.com/ultralytics/assets/releases/download/v0.0.0/${MODEL_NAME}.pt"
+PT_PATH="models/${MODEL_NAME}.pt"
+MODEL_PATH="models/${MODEL_NAME}-${IMG_SIZE}.onnx"
+EXPORT_PATH="models/${MODEL_NAME}.onnx"
 
 if [ -s "$MODEL_PATH" ] && [ "$(wc -c < "$MODEL_PATH")" -gt 1000000 ]; then
   echo "$MODEL_PATH already exists"
@@ -41,8 +44,9 @@ fi
 
 . .venv/bin/activate
 
-python - <<'PY'
+MODEL_NAME="$MODEL_NAME" IMG_SIZE="$IMG_SIZE" python - <<'PY'
 import importlib.util
+import os
 import subprocess
 import sys
 
@@ -52,9 +56,16 @@ if importlib.util.find_spec("ultralytics") is None:
 
 from ultralytics import YOLO
 
-model = YOLO("models/yolov8n-seg.pt")
-model.export(format="onnx", imgsz=640, opset=12, simplify=False)
+model_name = os.environ["MODEL_NAME"]
+img_size = int(os.environ["IMG_SIZE"])
+
+model = YOLO(f"models/{model_name}.pt")
+model.export(format="onnx", imgsz=img_size, opset=12, simplify=False)
 PY
+
+if [ -s "$EXPORT_PATH" ]; then
+  mv "$EXPORT_PATH" "$MODEL_PATH"
+fi
 
 if command -v curl >/dev/null 2>&1; then
   true

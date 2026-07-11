@@ -3,9 +3,12 @@ set -eu
 
 mkdir -p models
 
-PT_URL="https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n-seg.pt"
-PT_PATH="models/yolov8n-seg.pt"
-MODEL_PATH="models/yolov8n-seg.tflite"
+MODEL_NAME="${1:-yolov8n}"
+IMG_SIZE="${2:-640}"
+PT_URL="https://github.com/ultralytics/assets/releases/download/v0.0.0/${MODEL_NAME}.pt"
+PT_PATH="models/${MODEL_NAME}.pt"
+MODEL_PATH="models/${MODEL_NAME}-${IMG_SIZE}.tflite"
+EXPORT_PATH="models/${MODEL_NAME}.tflite"
 PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 
 if [ -s "$MODEL_PATH" ] && [ "$(wc -c < "$MODEL_PATH")" -gt 1000000 ]; then
@@ -38,15 +41,30 @@ fi
 
 . .venv-tflite/bin/activate
 
-python -m pip install --upgrade pip
-python -m pip install ultralytics "litert-torch>=0.9.0" "ai-edge-litert>=2.1.4"
+if ! python - <<'PY' >/dev/null 2>&1
+import ai_edge_litert
+import litert_torch
+import ultralytics
+PY
+then
+  python -m pip install --upgrade pip
+  python -m pip install ultralytics "litert-torch>=0.9.0" "ai-edge-litert>=2.1.4"
+fi
 
-MPLCONFIGDIR="${TMPDIR:-/tmp}" python - <<'PY'
+MODEL_NAME="$MODEL_NAME" IMG_SIZE="$IMG_SIZE" MPLCONFIGDIR="${TMPDIR:-/tmp}" python - <<'PY'
+import os
 from ultralytics import YOLO
 
-model = YOLO("models/yolov8n-seg.pt")
-model.export(format="tflite", imgsz=640)
+model_name = os.environ["MODEL_NAME"]
+img_size = int(os.environ["IMG_SIZE"])
+
+model = YOLO(f"models/{model_name}.pt")
+model.export(format="tflite", imgsz=img_size)
 PY
+
+if [ -s "$EXPORT_PATH" ]; then
+  mv "$EXPORT_PATH" "$MODEL_PATH"
+fi
 
 if [ ! -s "$MODEL_PATH" ] || [ "$(wc -c < "$MODEL_PATH")" -le 1000000 ]; then
   echo "TFLite export did not create a valid $MODEL_PATH" >&2
